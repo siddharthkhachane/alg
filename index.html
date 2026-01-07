@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>MyAlgo – Excel to Output Generator</title>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <style>
+    body{font-family:Arial, sans-serif; padding:20px; max-width:1100px;}
+    .row{display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin:10px 0;}
+    label{font-size:14px;}
+    select,input,button{padding:8px 10px; font-size:14px;}
+    button{cursor:pointer;}
+    .card{border:1px solid #ddd; border-radius:10px; padding:14px; margin-top:14px;}
+    .small{color:#555; font-size:13px;}
+    table{border-collapse:collapse; width:100%; margin-top:10px;}
+    th,td{border:1px solid #ddd; padding:8px; text-align:left; font-size:13px;}
+    th{background:#f6f6f6;}
+    .warn{color:#b45309;}
+  </style>
+</head>
+<body>
+  <h2>MyAlgo – Generate Output Sheet</h2>
+
+  <div class="card">
+    <div class="row">
+      <label><b>1) Upload Excel</b> (.xlsx):</label>
+      <input type="file" id="fileInput" accept=".xlsx" />
+    </div>
+
+    <div class="row">
+      <label><b>2) Run on</b></label>
+      <select id="sourceSelect">
+        <option value="Input">Input sheet (single company)</option>
+        <option value="Data sheet">Data sheet (all companies)</option>
+      </select>
+
+      <label style="margin-left:8px;"><b>3) Category</b></label>
+      <select id="categorySelect">
+        <option value="All">All</option>
+        <option value="Excellent">Excellent</option>
+        <option value="Good">Good</option>
+        <option value="Average">Average</option>
+        <option value="Below average">Below average</option>
+      </select>
+
+      <button id="btnRun">Process & Download</button>
+    </div>
+
+    <div class="small">
+      Output format matches the workbook’s <b>Output</b> sheet structure:
+      blank rows, “Output Table”, then columns: <b>Sr, Company, Investment, Amount, Trigger Price, Average Price, Close Price</b>.
+    </div>
+
+    <div id="status" class="small" style="margin-top:10px;"></div>
+    <div id="preview"></div>
+  </div>
+
+<script>
+(function(){
+  const AMOUNT = 100000;
+
+  function setStatus(msg, isWarn=false){
+    const el = document.getElementById('status');
+    el.innerHTML = isWarn ? `<span class="warn">${msg}</span>` : msg;
+  }
+
+  function excelDateToJS(v){
+    // SheetJS often returns Date objects if cellDates=true, else numbers or strings.
+    if (v instanceof Date) return v;
+    return null;
+  }
+
+  function readSheetRows(wb, sheetName){
+    const sheet = wb.Sheets[sheetName];
+    if (!sheet) return null;
+    // raw:true keeps numbers, cellDates:true attempts to parse Excel dates.
+    return XLSX.utils.sheet_to_json(sheet, { header: 1, raw: true, defval: null });
+  }
+
+  function parseMasterList(wb){
+    // Prefer reading from "Master list" sheet (present in MyAlgo new.xlsx)
+    const rows = readSheetRows(wb, "Master list");
+    const sets = {
+      "Excellent": new Set(),
+      "Good": new Set(),
+      "Average": new Set(),
+      "Below average": new Set()
+    };
+    if (!rows) return sets;
+
+    let current = null;
+    for (let i=0;i<rows.length;i++){
+      const v = rows[i] && rows[i][2]; // Column C has category labels and names in provided file
+      if (!v) continue;
+      const s = String(v).trim();
+      if (sets[s]) { current = s; continue; }
+      if (current && s) sets[current].add(s);
+    }
+    return sets;
+  }
+
+  function buildCompanyFilter(sets, category){
+    if (category === "All") return null;
+    return sets[category] || new Set();
+  }
+
+  function findSelIndicesForSheet(rows){
+    // Column G = index 6 has "Sel"
+    const sel = [];
+    for (let i=0;i<rows.length;i++){
+      if (rows[i] && rows[i][6] === "Sel") sel.push(i);
+    }
+    return sel;
+  }
+
+  function buildCompanySeries(rows){
+    // rows: header + data. We build company -> array of points sorted by appearance (sheet already date-wise).
+    // Columns: Date=B(1), Company=D(3), Price=E(4), Signal=G(6)
+    const series = new Map();
+    for (let i=1;i<rows.length;i++){
+      const r = rows[i];
+      if (!r) continue;
+      const company = r[3];
+      const price = r[4];
+      const signal = r[6];
+      const date = r[1];
+      if (company == null) continue;
+      if (typeof price !== "number") continue;
+      const key = String(company).trim();
+      if (!series.has(key)) series.set(key, []);
+      series.get(key).push({ idx:i, date, price, signal });
+    }
+    return series;
+  }
+
+  function computeForSel(company, initialPrice){
+    // Algorithm from the Word doc:
+    // Trigger prices at -10%, -20%, -30% of initial, rounded down to integer.
+    const t1 = Math.floor(initialPrice * 0.90);
+    const t2 = Math.floor(initialPrice * 0.80);
+    const t3 = Math.floor(initialPrice * 0.70);
+    const avg = Math.round((t1 + t2 + t3) / 3);
+    const close = Math.floor(avg * 1.30);
+    return { t1, t2, t3, avg, close };
+  }
+
+  function generateOutputRows(results){
+    // Results: array of {company, t1,t2,t3,avg,close}
+    // Output sheet layout (matching provided workbook):
+    const out = [];
+    // Rows 1-6 blank
+    for (let i=0;i<6;i++) out.push([null,null,null,null,null,null,null]);
+    // Row 7
+    out.push(["Output Table", null, null, null, null, null, null]);
+    // Row 8 blank
+    out.push([null,null,null,null,null,null,null]);
+    // Row 9 header
+    out.push(["Sr","Company","Investment","Amount","Trigger Price","Average Price","Close Price"]);
+    // Row 10 note
+    out.push([null,null,null,null,null,null,"30% above average price"]);
+
+    let sr = 1;
+    for (const r of results){
+      out.push([sr++, r.company, "Invest 1", AMOUNT, r.t1, r.avg, r.close]);
+      out.push([sr++, r.company, "Invest 2", AMOUNT, r.t2, null, null]);
+      out.push([sr++, r.company, "Invest 3", AMOUNT, r.t3, null, null]);
+    }
+    return out;
+  }
+
+  function renderPreview(outputAOA, maxRows=20){
+    const start = 8; // show from header row roughly
+    const slice = outputAOA.slice(start, Math.min(outputAOA.length, start+maxRows));
+    let html = `<table><thead><tr>` +
+      slice[0].map(x=>`<th>${x===null?"":String(x)}</th>`).join("") +
+      `</tr></thead><tbody>`;
+    for (let i=1;i<slice.length;i++){
+      html += `<tr>` + slice[i].map(x=>`<td>${x===null?"":String(x)}</td>`).join("") + `</tr>`;
+    }
+    html += `</tbody></table>`;
+    document.getElementById("preview").innerHTML = html;
+  }
+
+  async function process(){
+    const file = document.getElementById("fileInput").files[0];
+    if (!file){ alert("Select an Excel file first."); return; }
+
+    setStatus("Reading file...");
+    const buf = await file.arrayBuffer();
+    const wb = XLSX.read(buf, { type: "array", cellDates: true, raw: true });
+
+    const sourceSheet = document.getElementById("sourceSelect").value;
+    const category = document.getElementById("categorySelect").value;
+
+    const sets = parseMasterList(wb);
+    const filterSet = buildCompanyFilter(sets, category);
+
+    const rows = readSheetRows(wb, sourceSheet);
+    if (!rows){ alert(`Sheet not found: ${sourceSheet}`); return; }
+
+    // Collect results
+    const results = [];
+
+    if (sourceSheet === "Input") {
+      // Exactly one company: find first "Sel", compute from its price
+      const selIdx = findSelIndicesForSheet(rows)[0];
+      if (selIdx == null){ alert("'Sel' not found in Input sheet"); return; }
+      const company = String(rows[selIdx][3] || "").trim();
+      const initial = rows[selIdx][4];
+      if (typeof initial !== "number"){ alert("Initial price is missing/invalid at Sel row."); return; }
+
+      if (filterSet && !filterSet.has(company)){
+        setStatus(`Input company "${company}" is not in category "${category}". No rows generated.`, true);
+      } else {
+        const calc = computeForSel(company, initial);
+        results.push({ company, ...calc });
+      }
+    } else {
+      // Data sheet: each "Sel" row is a separate signal for that company.
+      // We'll compute based on initial price at Sel row (same as Input algorithm).
+      const sels = findSelIndicesForSheet(rows);
+      if (!sels.length){ alert("'Sel' not found in Data sheet"); return; }
+
+      for (const idx of sels){
+        const r = rows[idx];
+        const company = String(r[3] || "").trim();
+        const initial = r[4];
+        if (typeof initial !== "number") continue;
+        if (filterSet && !filterSet.has(company)) continue;
+
+        const calc = computeForSel(company, initial);
+        results.push({ company, ...calc });
+      }
+    }
+
+    if (!results.length){
+      setStatus("No matching rows generated (check your category filter).", true);
+      document.getElementById("preview").innerHTML = "";
+      return;
+    }
+
+    // Build output sheet content
+    const outputAOA = generateOutputRows(results);
+
+    // Create new workbook (keeps it simple and deterministic)
+    const outWb = XLSX.utils.book_new();
+    const outSheet = XLSX.utils.aoa_to_sheet(outputAOA);
+    XLSX.utils.book_append_sheet(outWb, outSheet, "Output");
+
+    // Optional preview
+    renderPreview(outputAOA);
+
+    const suffix = sourceSheet === "Input" ? "Single" : "All";
+    const fname = `MyAlgo_Output_${suffix}_${category.replace(/\s+/g,'_')}.xlsx`;
+    XLSX.writeFile(outWb, fname);
+
+    setStatus(`Done. Generated ${results.length} company record(s) → ${results.length*3} output rows. Download started.`);
+  }
+
+  document.getElementById("btnRun").addEventListener("click", process);
+})();
+</script>
+</body>
+</html>
